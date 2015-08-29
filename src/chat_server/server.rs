@@ -7,8 +7,12 @@ use std::mem;
 use std::net::SocketAddr;
 use std::io::Cursor;
 use std::io;
+use std::collections::HashMap;
+use std::rc::Rc;
 
 use super::connection::ChatConnection;
+use super::user::{ChatUser, Username};
+use super::room::{ChatRoom, Roomname};
 
 /// The token for the tcp listener socket.
 /// kqueue has some wierd behaviors when the server is Token(0) so we'll use token 1.
@@ -21,24 +25,35 @@ pub struct ChatServer {
 
     /// All the connections to the chat server, indexed by their token.
     connections: Slab<ChatConnection>,
+
+    /// Hashmap of connections with a registered username
+    users: HashMap<mio::Token, ChatUser>,
+
+    /// Hashmap of rooms currently available
+    rooms: HashMap<Roomname, ChatRoom>,
+
+    /// Hashmap of usernames => tokens for quick lookup and to prevent different connections
+    /// from claiming the same username
+    user_name_lookup: HashMap<Username, mio::Token>,
 }
 
 impl ChatServer {
     // Initialize a new `ChatServer` server from the given TCP listener socket
     pub fn new(server: TcpListener) -> ChatServer {
+        let mut rooms = HashMap::new();
+        rooms.insert("default".to_string(), ChatRoom {
+            name: "default".to_string(),
+            members: HashMap::new()
+        });
+
         ChatServer {
             server: server,
-            connections: Slab::new_starting_at(mio::Token(SERVER_TOKEN.0 + 1), 1024)
+            connections: Slab::new_starting_at(mio::Token(SERVER_TOKEN.0 + 1), 1024),
+            users: HashMap::new(),
+            rooms: rooms,
+            user_name_lookup: HashMap::new()
         }
     }
-
-    pub fn with_max_connections(server: TcpListener, max_connections: usize) -> ChatServer {
-        ChatServer {
-            server: server,
-            connections: Slab::new_starting_at(mio::Token(SERVER_TOKEN.0 + 1), max_connections)
-        }
-    }
-
 
     /// Function that is called when the chat server recieves a call to ready and the event set contains readable
     /// Handles all logic related to reading from any connection besides the server connection
@@ -46,35 +61,35 @@ impl ChatServer {
         let mut ret = Ok(());
         if let Some(message) = self.connections[token].read(event_loop) {
 
-            let mut bad_conn_tokens = Vec::new();
+            let location = self.users.get(&token).unwrap().location.clone();
 
-            // Queue up a write for all connected clients.
-            for conn in self.connections.iter_mut() {
-                if conn.token() == token {
-                    continue;
-                }
-                // Message should be stored as Rc<Something> and we can just pass references to it
-                conn.send_message(message.clone());
-
-                conn.reregister(event_loop)
-                    .unwrap_or_else(|e| {
-                        // Cannot remove the connection from self.connections since we are currently
-                        // iterating over it.
-                        bad_conn_tokens.push(token);
-                        ret = Result::Err(e);
-                    });
-            }
+            self.write_message_to_room(event_loop, &location, message);
 
             // Remove all bad connections or connections that have been closed
-            for bad_token in bad_conn_tokens {
-                self.reset_connection(event_loop, bad_token);
-            }
+            
             if self.connections[token].is_closed() {
                 self.connections.remove(token);
             }
         }
 
         return ret;
+    }
+
+    fn write_message_to_room(&mut self, event_loop: &mut mio::EventLoop<ChatServer>, room_name: &Roomname, message: Rc<Vec<u8>>) {
+        let mut bad_conn_tokens = Vec::new();
+        let tokens: Vec<_> = self.rooms.get(room_name).unwrap().members.keys().cloned().collect();
+        for token in tokens {
+            let conn = &mut self.get_connection(token);
+            conn.send_message(message.clone());
+            conn.reregister(event_loop)
+                .unwrap_or_else(|e| {
+                    bad_conn_tokens.push(token);
+            });
+        }
+
+        for bad_token in bad_conn_tokens {
+            self.reset_connection(event_loop, bad_token);
+        }
     }
 
     /// If the server connection needs to be reset, then that means the application should be shut down.
@@ -110,7 +125,15 @@ impl ChatServer {
             // If we successfully insert, then register our connection.
             Some(token) => {
                 match self.get_connection(token).register(event_loop) {
-                    Ok(_) => {},
+                    Ok(_) => {
+                        self.users.insert(token, ChatUser {
+                            id: token,
+                            user_name: token.0.to_string(),
+                            location: "default".to_string()
+                        });
+                        self.rooms.get_mut("default").unwrap().members.insert(token, token.0.to_string());
+
+                    },
                     Err(e) => {
                         self.connections.remove(token);
                         return Err(format!("Failed to register {:?} connection with event loop, {:?}", token, e));
@@ -122,6 +145,7 @@ impl ChatServer {
             }
         };
 
+       
         return Ok(())
     }
 

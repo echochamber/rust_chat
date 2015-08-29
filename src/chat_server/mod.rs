@@ -1,6 +1,7 @@
 mod server;
 mod connection;
-
+mod user;
+mod room;
 
 use std::net::SocketAddr;
 use mio;
