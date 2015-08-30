@@ -67,7 +67,7 @@ impl ChatConnection {
     /// Returns an RC (Thread-local reference-counted box) so that we can just copy a reference to each
     /// connections send_queue, and once they have all been written to, the reference count should drop
     /// to 0 and they the vec should automatically be freed.
-    pub fn read(&mut self, event_loop: &mut mio::EventLoop<ChatServer>) -> Option<Rc<Vec<u8>>> {
+    pub fn read(&mut self, event_loop: &mut mio::EventLoop<ChatServer>) -> Option<Vec<u8>> {
         match self.socket.try_read_buf(&mut self.read_buf) {
             // 0 Bytes were read
             Ok(Some(0)) => {
@@ -94,7 +94,7 @@ impl ChatConnection {
                     // which is just an iterator that returns eof once its iterated over "limit" elements.
                     self.read_buf.truncate(limit);
 
-                    return Some(Rc::new(read_buf));
+                    return Some(read_buf);
 
                 };
             }

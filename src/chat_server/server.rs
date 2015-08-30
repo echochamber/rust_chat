@@ -1,5 +1,5 @@
 use mio;
-use mio::{EventSet, PollOpt};
+use mio::{Token, EventLoop, EventSet, PollOpt};
 use mio::tcp::*;
 use mio::util::Slab;
 use bytes::{Take, ByteBuf};
@@ -10,13 +10,14 @@ use std::io;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use super::app::ChatApp;
 use super::connection::ChatConnection;
 use super::user::{ChatUser, Username};
 use super::room::{ChatRoom, Roomname};
 
 /// The token for the tcp listener socket.
 /// kqueue has some wierd behaviors when the server is Token(0) so we'll use token 1.
-pub const SERVER_TOKEN: mio::Token = mio::Token(1);
+pub const SERVER_TOKEN: Token = Token(1);
 
 /// Represents the server's connection for the chat app
 pub struct ChatServer {
@@ -26,44 +27,27 @@ pub struct ChatServer {
     /// All the connections to the chat server, indexed by their token.
     connections: Slab<ChatConnection>,
 
-    /// Hashmap of connections with a registered username
-    users: HashMap<mio::Token, ChatUser>,
-
-    /// Hashmap of rooms currently available
-    rooms: HashMap<Roomname, ChatRoom>,
-
-    /// Hashmap of usernames => tokens for quick lookup and to prevent different connections
-    /// from claiming the same username
-    user_name_lookup: HashMap<Username, mio::Token>,
+    app: ChatApp
 }
 
 impl ChatServer {
     // Initialize a new `ChatServer` server from the given TCP listener socket
     pub fn new(server: TcpListener) -> ChatServer {
-        let mut rooms = HashMap::new();
-        rooms.insert("default".to_string(), ChatRoom {
-            name: "default".to_string(),
-            members: HashMap::new()
-        });
 
         ChatServer {
             server: server,
-            connections: Slab::new_starting_at(mio::Token(SERVER_TOKEN.0 + 1), 1024),
-            users: HashMap::new(),
-            rooms: rooms,
-            user_name_lookup: HashMap::new()
+            connections: Slab::new_starting_at(Token(SERVER_TOKEN.0 + 1), 1024),
+            app: ChatApp::new()
         }
     }
 
     /// Function that is called when the chat server recieves a call to ready and the event set contains readable
     /// Handles all logic related to reading from any connection besides the server connection
-    fn readable(&mut self, event_loop: &mut mio::EventLoop<ChatServer>, token: mio::Token) -> io::Result<()> {
+    fn read(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token) -> io::Result<()> {
         let mut ret = Ok(());
         if let Some(message) = self.connections[token].read(event_loop) {
 
-            let location = self.users.get(&token).unwrap().location.clone();
-
-            self.write_message_to_room(event_loop, &location, message);
+            self.write_message_from_token(event_loop, token, message);
 
             // Remove all bad connections or connections that have been closed
             
@@ -75,25 +59,66 @@ impl ChatServer {
         return ret;
     }
 
-    fn write_message_to_room(&mut self, event_loop: &mut mio::EventLoop<ChatServer>, room_name: &Roomname, message: Rc<Vec<u8>>) {
-        let mut bad_conn_tokens = Vec::new();
-        let tokens: Vec<_> = self.rooms.get(room_name).unwrap().members.keys().cloned().collect();
-        for token in tokens {
-            let conn = &mut self.get_connection(token);
-            conn.send_message(message.clone());
-            conn.reregister(event_loop)
-                .unwrap_or_else(|e| {
-                    bad_conn_tokens.push(token);
-            });
-        }
+    fn write(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token) -> io::Result<()> {
+        // Should never recieve write events for the server connection
+        assert!(SERVER_TOKEN != token, "Received writable event for the server's token");
 
-        for bad_token in bad_conn_tokens {
-            self.reset_connection(event_loop, bad_token);
+        super::log_something(format!("Write event for {:?}", token));
+
+        match self.get_connection(token).write() {
+            Ok(_) => {
+                self.get_connection(token).reregister(event_loop);
+                return Ok(());
+            },
+            Err(e) => {
+                super::log_something(format!("Write event failed for {:?}, {:?}", token, e));
+                self.reset_connection(event_loop, token);
+                return Err(e);
+            }
         }
     }
 
+    fn write_message_from_token(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token, message: Vec<u8>) {
+        let mut bad_conn_tokens = Vec::new();
+
+
+        // Handle the case where the connection we read the message from has already registered a user
+        if let Some(username) = self.app.get_username(token) {
+
+            // Todo handle commands if the message starts with a /
+            let mut mes_with_sender = username.into_bytes();
+            mes_with_sender.extend(": ".as_bytes());
+            mes_with_sender.extend(message);
+            
+            let mes_rc = Rc::new(mes_with_sender);
+
+            {
+                let tokens = self.app.get_message_recipients(token);
+                for token in tokens {
+                    let conn = &mut self.get_connection(token);
+                    conn.send_message(mes_rc.clone());
+                    conn.reregister(event_loop)
+                        .unwrap_or_else(|e| {
+                            bad_conn_tokens.push(token);
+                    });
+                }
+            }
+
+            for bad_token in bad_conn_tokens {
+                self.reset_connection(event_loop, bad_token);
+            }
+
+            return;
+        };
+
+        // Handle the case where the connection we read the message from has not registered a user yet
+
+        // TODO: Create a username with the message contents if we can.
+        // If we can't then queue a message to be sent to the connection telling them to pick a different username.
+    }
+
     /// If the server connection needs to be reset, then that means the application should be shut down.
-    fn reset_connection(&mut self, event_loop: &mut mio::EventLoop<ChatServer>, token: mio::Token) {
+    fn reset_connection(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token) {
         if SERVER_TOKEN == token {
             event_loop.shutdown();
         } else {
@@ -101,13 +126,13 @@ impl ChatServer {
         }
     }
 
-    fn get_connection<'a>(&'a mut self, token: mio::Token) -> &'a mut ChatConnection {
+    fn get_connection<'a>(&'a mut self, token: Token) -> &'a mut ChatConnection {
         &mut self.connections[token]
     }
 
     /// Function that is called when the chat server recieves a call to ready with its own token and a readable EventSet
     /// Accept a new connection
-    fn accept(&mut self, event_loop: &mut mio::EventLoop<ChatServer>) -> Result<(), String> {
+    fn accept(&mut self, event_loop: &mut EventLoop<ChatServer>) -> Result<(), String> {
 
         // Log an error if there is no socket
         let sock = match self.server.accept() {
@@ -124,16 +149,9 @@ impl ChatServer {
         match self.connections.insert_with(|token| {ChatConnection::new(sock, token)}) {
             // If we successfully insert, then register our connection.
             Some(token) => {
+                self.get_connection(token).send_message(Rc::new("Server: Select a username:\n".into()));
                 match self.get_connection(token).register(event_loop) {
-                    Ok(_) => {
-                        self.users.insert(token, ChatUser {
-                            id: token,
-                            user_name: token.0.to_string(),
-                            location: "default".to_string()
-                        });
-                        self.rooms.get_mut("default").unwrap().members.insert(token, token.0.to_string());
-
-                    },
+                    Ok(_) => {},
                     Err(e) => {
                         self.connections.remove(token);
                         return Err(format!("Failed to register {:?} connection with event loop, {:?}", token, e));
@@ -144,13 +162,12 @@ impl ChatServer {
                 return Err("Failed to insert connection into slab".to_string());
             }
         };
-
        
         return Ok(())
     }
 
     /// Since the socket is registered
-    fn reregister(&mut self, event_loop: &mut mio::EventLoop<ChatServer>) {
+    fn reregister(&mut self, event_loop: &mut EventLoop<ChatServer>) {
         event_loop.reregister(
             &self.server,
             SERVER_TOKEN,
@@ -170,7 +187,7 @@ impl mio::Handler for ChatServer {
 
     // Called by the EventLoop whenever a socket is ready to be acted on.
     // Is passed the token for that socket and the current EventSet that socket is ready for.
-    fn ready(&mut self, event_loop: &mut mio::EventLoop<ChatServer>, token: mio::Token, events: mio::EventSet) {
+    fn ready(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token, events: mio::EventSet) {
         super::log_something(format!("socket is ready; token={:?}; events={:?}", token, events));
 
         if events.is_error() {
@@ -205,7 +222,7 @@ impl mio::Handler for ChatServer {
                 self.reregister(event_loop);
             } else {
 
-                self.readable(event_loop, token)
+                self.read(event_loop, token)
                     .and_then(|_| self.get_connection(token).reregister(event_loop))
                     .unwrap_or_else(|e| {
                         super::log_something(format!("Read event failed for {:?}: {:?}", token, e));
