@@ -2,7 +2,6 @@
 
 extern crate mio;
 extern crate bytes;
-extern crate time;
 
 mod chat_server;
 

@@ -4,7 +4,6 @@ use mio::tcp::*;
 use mio::util::Slab;
 use std::io;
 use std::rc::Rc;
-use time;
 
 use super::app::ChatApp;
 use super::connection::ChatConnection;
@@ -31,6 +30,8 @@ impl ChatServer {
 
         ChatServer {
             server: server,
+            // Not sure what will happen here once token # goes above 1024. 
+            // Probably will fail, could fix it by using a vector. Will fix later.
             connections: Slab::new_starting_at(Token(SERVER_TOKEN.0 + 1), 1024),
             app: ChatApp::new()
         }
@@ -107,11 +108,8 @@ impl ChatServer {
         let mut bad_conn_tokens: Vec<Token> = Vec::new();
 
         if let Some(username) = self.app.get_username(token) {
-            let mut timestamp = time::strftime("%Y:%m:%d %H:%M:%S", &time::now()).unwrap().into_bytes();
             // Todo handle commands if the message starts with a /
-            let mut mes_with_sender: Vec<u8> = timestamp;
-            mes_with_sender.extend(" - ".as_bytes());
-            mes_with_sender.extend(username.into_bytes());
+            let mut mes_with_sender: Vec<u8> = username.into_bytes();
             mes_with_sender.extend(": ".as_bytes());
             mes_with_sender.extend(message.as_bytes());
             
