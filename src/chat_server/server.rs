@@ -2,20 +2,13 @@ use mio;
 use mio::{Token, EventLoop, EventSet, PollOpt};
 use mio::tcp::*;
 use mio::util::Slab;
-use bytes::{Take, ByteBuf};
-use std::mem;
-use std::net::SocketAddr;
-use std::io::Cursor;
 use std::io;
-use std::collections::HashMap;
 use std::rc::Rc;
 use time;
 
 use super::app::ChatApp;
 use super::connection::ChatConnection;
-use super::user::{ChatUser, Username};
-use super::room::{ChatRoom, Roomname};
-use super::message::is_command;
+use super::command::{is_command, ChatCommand};
 
 /// The token for the tcp listener socket.
 /// kqueue has some wierd behaviors when the server is Token(0) so we'll use token 1.
@@ -61,32 +54,31 @@ impl ChatServer {
     }
 
     fn write(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token) -> io::Result<()> {
-        // Should never recieve write events for the server connection
-        assert!(SERVER_TOKEN != token, "Received writable event for the server's token");
-
         super::log_something(format!("Write event for {:?}", token));
+        assert!(SERVER_TOKEN != token, "Received writable event for Server");
 
-        match self.get_connection(token).write() {
-            Ok(_) => {
-                self.get_connection(token).reregister(event_loop);
-                return Ok(());
-            },
-            Err(e) => {
+        self.get_connection(token).write()
+            .and_then(|_| self.get_connection(token).reregister(event_loop))
+            .unwrap_or_else(|e| {
                 super::log_something(format!("Write event failed for {:?}, {:?}", token, e));
                 self.reset_connection(event_loop, token);
-                return Err(e);
-            }
-        }
+            });
+
+        return Ok(());
     }
 
     fn handle_message_read_from_client(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token, message: String) {
         if is_command(&message) {
-            self.handle_command_message(event_loop, token, message);
-        } else if let Some(username) = self.app.get_username(token) {
-            self.handle_message_from_authorized_user(event_loop, token, username, message);
-        } else {
-            self.handle_message_from_unauthorized_user(event_loop, token, message);
+            self.handle_command_message(event_loop, token, &message);
+            return;
         }
+
+        if let Some(username) = self.app.get_username(token) {
+            self.handle_message_from_authorized_user(event_loop, token, username, message);
+            return;
+        }
+
+        self.handle_message_from_unauthorized_user(event_loop, token, message);
     }
 
     fn handle_message_from_unauthorized_user(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token, message: String) {
@@ -94,7 +86,9 @@ impl ChatServer {
             Some(name) => {
                 match self.app.register_user(token, name.to_string()) {
                     Ok(_) => {
-                        self.connections[token].send_message(Rc::new("Server: you have been successfully authorized\n".to_string().into_bytes()))
+                        let conn = self.get_connection(token);
+                        conn.send_message(Rc::new("Server: you have been successfully authorized\n".to_string().into_bytes()));
+                        conn.reregister(event_loop);
                         // TODO send a message to the client saying they have successfully authed as the given username
                     },
                     Err(e) => {
@@ -112,8 +106,6 @@ impl ChatServer {
     fn handle_message_from_authorized_user(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token, username: String, message: String) {
         let mut bad_conn_tokens: Vec<Token> = Vec::new();
 
-
-        
         if let Some(username) = self.app.get_username(token) {
             let mut timestamp = time::strftime("%Y:%m:%d %H:%M:%S", &time::now()).unwrap().into_bytes();
             // Todo handle commands if the message starts with a /
@@ -129,9 +121,8 @@ impl ChatServer {
             {
                 let tokens = self.app.get_message_recipients(token);
                 bad_conn_tokens = tokens.iter().filter(|recipient_token| {
-                    let conn = &mut self.get_connection(**recipient_token);
+                    let conn = self.get_connection(**recipient_token);
                     conn.send_message(mes_rc.clone());
-                    
                     conn.reregister(event_loop).is_err()
                 }).cloned().collect();
             }
@@ -142,7 +133,29 @@ impl ChatServer {
         };
     }
 
-    fn handle_command_message(&self, event_loop: &mut EventLoop<ChatServer>, token: Token, message: String) {
+    fn handle_command_message(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token, message: &String) {
+        match ChatCommand::new(message) {
+            Some(ChatCommand::ListRooms) => {
+                let mut list = String::new();
+                for room_name in self.app.get_room_list() {
+                    list.push_str(room_name.as_str());
+                    list.push('\n');
+                }
+                let conn = self.get_connection(token);
+                conn.send_message(Rc::new(list.clone().into_bytes()));
+                conn.reregister(event_loop);
+            },
+            Some(ChatCommand::ChangeRoom(room_name)) => {
+                self.app.move_rooms(token, &room_name);
+
+                let conn = self.get_connection(token);
+                conn.send_message(Rc::new(format!("Moved to room {}\n", room_name).to_string().into_bytes()));
+                conn.reregister(event_loop);
+            }
+            None => {}
+        }
+
+        
         super::log_something(format!("Command read {}", message));
     }
 
@@ -151,7 +164,9 @@ impl ChatServer {
         if SERVER_TOKEN == token {
             event_loop.shutdown();
         } else {
+            self.connections[token].deregister(event_loop);
             self.connections.remove(token);
+            self.app.remove_user(token);
         }
     }
 
@@ -232,15 +247,7 @@ impl mio::Handler for ChatServer {
         }
 
         if events.is_writable() {
-            super::log_something(format!("Write event for {:?}", token));
-            assert!(SERVER_TOKEN != token, "Received writable event for Server");
-
-            self.get_connection(token).write()
-                .and_then(|_| self.get_connection(token).reregister(event_loop))
-                .unwrap_or_else(|e| {
-                    super::log_something(format!("Write event failed for {:?}, {:?}", token, e));
-                    self.reset_connection(event_loop, token);
-                });
+            self.write(event_loop, token);
         }
 
 
@@ -252,7 +259,6 @@ impl mio::Handler for ChatServer {
             } else {
 
                 self.read(event_loop, token)
-                    .and_then(|_| self.get_connection(token).reregister(event_loop))
                     .unwrap_or_else(|e| {
                         super::log_something(format!("Read event failed for {:?}: {:?}", token, e));
                         self.reset_connection(event_loop, token);

@@ -134,8 +134,6 @@ impl ChatConnection {
                         super::log_something(format!("client flushing buf; WouldBlock"));
 
                         // Put message back into the queue so we can try again
-                        // Put it at the front so the messages are written in the correct order
-                        // Add a timestamp to the message for convenience?
                         self.send_queue.insert(0, buf);
                         Ok(())
                     },
@@ -181,10 +179,7 @@ impl ChatConnection {
             self.token,
             self.interest,
             mio::PollOpt::edge() | mio::PollOpt::oneshot()
-        ).or_else(|e| {
-            super::log_something(format!("Failed to reregister {:?}, {:?}", self.token, e));
-            Err(e)
-        })
+        )
     }
 
     pub fn reregister(&self, event_loop: &mut mio::EventLoop<ChatServer>) -> io::Result<()> {
@@ -193,10 +188,11 @@ impl ChatConnection {
             self.token,
             self.interest,
             PollOpt::edge() | PollOpt::oneshot()
-        ).or_else(|e| {
-            super::log_something(format!("Failed to reregister {:?}, {:?}", self.token, e));
-            Err(e)
-        })
+        )
+    }
+
+    pub fn deregister(&self, event_loop: &mut mio::EventLoop<ChatServer>) -> io::Result<()> {
+        event_loop.deregister(&self.socket)
     }
 
     pub fn token(&self) -> Token {

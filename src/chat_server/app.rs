@@ -34,7 +34,7 @@ impl<'a> ChatApp {
 	/// If the given token were to send a message, return the list tokens for connections that should recieve that message.
 	pub fn get_message_recipients(&self, sender: Token) -> Vec<Token> {
 		let room_name = &self.users.get(&sender).unwrap().location;
-		return self.rooms.get(room_name).unwrap().members.clone();
+		return self.rooms.get(room_name).unwrap().members.iter().cloned().collect();
 	}
 
 	pub fn get_room_list(&self) -> Vec<Roomname> {
@@ -52,10 +52,10 @@ impl<'a> ChatApp {
 		};
 	}
 
-	pub fn move_rooms(&mut self, token: Token, dest: Roomname) {
+	pub fn move_rooms(&mut self, token: Token, dest: &Roomname) {
 
 		// Create the room if it doesn't exist yet
-		if !self.rooms.contains_key(&dest) {
+		if !self.rooms.contains_key(dest) {
 			self.rooms.insert(dest.clone(), ChatRoom::new(dest.clone()));
 		}
 
@@ -63,7 +63,7 @@ impl<'a> ChatApp {
 		let prev_location = user.location.clone();
 		user.location = dest.clone();
 
-		self.rooms.get_mut(&dest).unwrap().members.push(token);
+		self.rooms.get_mut(dest).unwrap().members.insert(token);
 	}
 
 	/// Returns true if the user was registered, false otherwise.
@@ -84,11 +84,19 @@ impl<'a> ChatApp {
 			location: "default".into()
 		};
 
-		self.rooms.get_mut("default".into()).unwrap().members.push(token);
+		self.rooms.get_mut("default".into()).unwrap().members.insert(token);
 		self.users.insert(token, user);
 		self.user_name_lookup.insert(user_name, token);
 
 		return Ok(());
+	}
+
+	pub fn remove_user(&mut self, token: Token) {
+		let user = self.users.remove(&token).unwrap();
+		self.rooms.get_mut(&user.location).unwrap().members.remove(&token);
+		self.user_name_lookup.remove(&user.user_name);
+
+		println!("{:?}", self.user_name_lookup);
 	}
 
 
