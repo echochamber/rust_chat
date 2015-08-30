@@ -9,11 +9,13 @@ use std::io::Cursor;
 use std::io;
 use std::collections::HashMap;
 use std::rc::Rc;
+use time;
 
 use super::app::ChatApp;
 use super::connection::ChatConnection;
 use super::user::{ChatUser, Username};
 use super::room::{ChatRoom, Roomname};
+use super::message::is_command;
 
 /// The token for the tcp listener socket.
 /// kqueue has some wierd behaviors when the server is Token(0) so we'll use token 1.
@@ -45,15 +47,14 @@ impl ChatServer {
     /// Handles all logic related to reading from any connection besides the server connection
     fn read(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token) -> io::Result<()> {
         let mut ret = Ok(());
+
+        // If we get Some back, then the message has been fully recieved and we can handle it accordingly
         if let Some(message) = self.connections[token].read(event_loop) {
+            self.handle_message_read_from_client(event_loop, token, message);
+        }
 
-            self.write_message_from_token(event_loop, token, message);
-
-            // Remove all bad connections or connections that have been closed
-            
-            if self.connections[token].is_closed() {
-                self.connections.remove(token);
-            }
+        if self.connections[token].is_closed() {
+            self.connections.remove(token);
         }
 
         return ret;
@@ -78,43 +79,71 @@ impl ChatServer {
         }
     }
 
-    fn write_message_from_token(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token, message: Vec<u8>) {
-        let mut bad_conn_tokens = Vec::new();
+    fn handle_message_read_from_client(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token, message: String) {
+        if is_command(&message) {
+            self.handle_command_message(event_loop, token, message);
+        } else if let Some(username) = self.app.get_username(token) {
+            self.handle_message_from_authorized_user(event_loop, token, username, message);
+        } else {
+            self.handle_message_from_unauthorized_user(event_loop, token, message);
+        }
+    }
+
+    fn handle_message_from_unauthorized_user(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token, message: String) {
+        match message.split(char::is_whitespace).nth(0) {
+            Some(name) => {
+                match self.app.register_user(token, name.to_string()) {
+                    Ok(_) => {
+                        self.connections[token].send_message(Rc::new("Server: you have been successfully authorized\n".to_string().into_bytes()))
+                        // TODO send a message to the client saying they have successfully authed as the given username
+                    },
+                    Err(e) => {
+                        super::log_something(format!("{}", e));
+                        self.connections[token].send_message(Rc::new("Server: That username is taken, please try another\n".to_string().into_bytes()))
+                    }
+                }
+            },
+            None => {
+                // Do nothing, the client sent either just a newline or newline + whitespace
+            }
+        }
+    }
+
+    fn handle_message_from_authorized_user(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token, username: String, message: String) {
+        let mut bad_conn_tokens: Vec<Token> = Vec::new();
 
 
-        // Handle the case where the connection we read the message from has already registered a user
+        
         if let Some(username) = self.app.get_username(token) {
-
+            let mut timestamp = time::strftime("%Y:%m:%d %H:%M:%S", &time::now()).unwrap().into_bytes();
             // Todo handle commands if the message starts with a /
-            let mut mes_with_sender = username.into_bytes();
+            let mut mes_with_sender: Vec<u8> = timestamp;
+            mes_with_sender.extend(" - ".as_bytes());
+            mes_with_sender.extend(username.into_bytes());
             mes_with_sender.extend(": ".as_bytes());
-            mes_with_sender.extend(message);
+            mes_with_sender.extend(message.as_bytes());
             
             let mes_rc = Rc::new(mes_with_sender);
 
+            // Enter a new scope so the borrow ends before we reset connections for bad tokens
             {
                 let tokens = self.app.get_message_recipients(token);
-                for token in tokens {
-                    let conn = &mut self.get_connection(token);
+                bad_conn_tokens = tokens.iter().filter(|recipient_token| {
+                    let conn = &mut self.get_connection(**recipient_token);
                     conn.send_message(mes_rc.clone());
-                    conn.reregister(event_loop)
-                        .unwrap_or_else(|e| {
-                            bad_conn_tokens.push(token);
-                    });
-                }
+                    
+                    conn.reregister(event_loop).is_err()
+                }).cloned().collect();
             }
 
             for bad_token in bad_conn_tokens {
                 self.reset_connection(event_loop, bad_token);
             }
-
-            return;
         };
+    }
 
-        // Handle the case where the connection we read the message from has not registered a user yet
-
-        // TODO: Create a username with the message contents if we can.
-        // If we can't then queue a message to be sent to the connection telling them to pick a different username.
+    fn handle_command_message(&self, event_loop: &mut EventLoop<ChatServer>, token: Token, message: String) {
+        super::log_something(format!("Command read {}", message));
     }
 
     /// If the server connection needs to be reset, then that means the application should be shut down.

@@ -3,6 +3,7 @@ mod connection;
 mod user;
 mod room;
 mod app;
+mod message;
 
 use std::net::SocketAddr;
 use mio;

@@ -7,3 +7,4 @@ authors = ["Jason Schein <jasonschein@gmail.com>"]
 [dependencies]
 mio = "0.4.2"
 bytes = "0.2.11"
+time = "0.1.32"

@@ -72,18 +72,21 @@ impl<'a> ChatApp {
 			return Err("A user is already registered for that token".into());
 		}
 
-		if self.user_name_lookup.contains_key(&user_name) {
+		// This is not correctly detecting collisions yet
+		if self.user_name_lookup.get(&user_name).is_some() {
+			println!("Collision");
 			return Err("A user with that name is already registered".into());
 		}
 
 		let mut user = ChatUser {
 			id: token,
-			user_name: user_name,
+			user_name: user_name.clone(),
 			location: "default".into()
 		};
 
 		self.rooms.get_mut("default".into()).unwrap().members.push(token);
 		self.users.insert(token, user);
+		self.user_name_lookup.insert(user_name, token);
 
 		return Ok(());
 	}
