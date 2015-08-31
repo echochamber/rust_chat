@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use mio::Token;
 
-use super::connection::ChatConnection;
 use super::user::{ChatUser, Username};
 use super::room::{ChatRoom, Roomname};
 
@@ -26,7 +25,7 @@ impl<'a> ChatApp {
 			user_name_lookup: HashMap::new()
 		};
 
-		app.rooms.insert("default".into(), ChatRoom::new("default".into()));
+		app.rooms.insert("default".to_string(), ChatRoom::new("default".to_string()));
 
 		app
 	}
@@ -60,9 +59,10 @@ impl<'a> ChatApp {
 		}
 
 		let user = self.users.get_mut(&token).unwrap();
-		let prev_location = user.location.clone();
-		user.location = dest.clone();
 
+		self.rooms.get_mut(&user.location).unwrap().members.remove(&token);
+
+		user.location = dest.clone();
 		self.rooms.get_mut(dest).unwrap().members.insert(token);
 	}
 
@@ -78,7 +78,7 @@ impl<'a> ChatApp {
 			return Err("A user with that name is already registered".into());
 		}
 
-		let mut user = ChatUser {
+		let user = ChatUser {
 			id: token,
 			user_name: user_name.clone(),
 			location: "default".into()
@@ -97,15 +97,5 @@ impl<'a> ChatApp {
 		self.user_name_lookup.remove(&user.user_name);
 
 		println!("{:?}", self.user_name_lookup);
-	}
-
-
-	pub fn move_user_to_room(&mut self) {
-		// self.users.insert(token, ChatUser {
-  //           id: token,
-  //           user_name: token.0.to_string(),
-  //           location: "default".to_string()
-  //       });
-  //       self.rooms.get_mut("default").unwrap().members.insert(token, token.0.to_string());
 	}
 }

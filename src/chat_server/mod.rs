@@ -6,11 +6,9 @@ mod app;
 mod command;
 
 use std::net::SocketAddr;
-use mio;
-use mio::{Token, EventLoop};
+use mio::EventLoop;
 use mio::tcp::TcpListener;
-use self::connection::*;
-use self::server::*;
+use self::server::{SERVER_TOKEN, ChatServer};
 
 // Easy logging for now
 pub fn log_something<T: ::std::fmt::Debug>(logged_thing: T) {
@@ -32,6 +30,6 @@ pub fn run_server(address: SocketAddr) {
     let mut pong = ChatServer::new(server);
 
     // Run the `ChatServer` server
-    println!("running pingpong server; port=6567");
+    println!("running chat server; ip={} port={}", address.ip(), address.port());
     event_loop.run(&mut pong).unwrap();
 }

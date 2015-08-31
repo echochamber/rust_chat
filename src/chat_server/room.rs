@@ -1,12 +1,11 @@
-use mio;
-use super::user::Username;
+use mio::Token;
 use std::collections::HashSet;
 
 pub type Roomname = String;
 
 pub struct ChatRoom {
 	pub name: Roomname,
-	pub members: HashSet<mio::Token>
+	pub members: HashSet<Token>
 }
 
 impl ChatRoom {

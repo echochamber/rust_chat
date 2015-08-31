@@ -1,4 +1,6 @@
 #![feature(convert)]
+#![feature(ip_addr)]
+#![allow(unused_must_use)]
 
 extern crate mio;
 extern crate bytes;

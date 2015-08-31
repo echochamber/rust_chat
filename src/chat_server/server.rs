@@ -39,7 +39,6 @@ impl ChatServer {
     /// Function that is called when the chat server recieves a call to ready and the event set contains readable
     /// Handles all logic related to reading from any connection besides the server connection
     fn read(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token) -> io::Result<()> {
-        let mut ret = Ok(());
 
         // If we get Some back, then the message has been fully recieved and we can handle it accordingly
         if let Some(message) = self.connections[token].read(event_loop) {
@@ -50,9 +49,11 @@ impl ChatServer {
             self.connections.remove(token);
         }
 
-        return ret;
+        return Ok(());
     }
 
+    /// Function that is called when the chat server recieves a call to ready and the event set contains writable
+    /// Handles all logic related to writing to any client connections
     fn write(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token) -> io::Result<()> {
         super::log_something(format!("Write event for {:?}", token));
         assert!(SERVER_TOKEN != token, "Received writable event for Server");
@@ -67,6 +68,10 @@ impl ChatServer {
         return Ok(());
     }
 
+    /// Handle the message differnetly depending on the state of the client, and the message type
+    /// If the message starts with a '/' then handle it as a command.
+    /// If there is no entry in the app.users hashmap for this token, then handle the message as the user requesting their username
+    /// If these is an entry in the app.users hashmap then handle the message as the user sending a message to everbody in the same room as them
     fn handle_message_read_from_client(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token, message: String) {
         if is_command(&message) {
             self.handle_command_message(event_loop, token, &message);
@@ -82,6 +87,8 @@ impl ChatServer {
     }
 
     fn handle_message_from_unauthorized_user(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token, message: String) {
+        // We could validate that this message has no whitepspace, but for now just take the first piece of the message
+        // split by whitespace and use that as the clients username.
         match message.split(char::is_whitespace).nth(0) {
             Some(name) => {
                 match self.app.register_user(token, name.to_string()) {
@@ -103,36 +110,38 @@ impl ChatServer {
         }
     }
 
+    /// The user is sending a message to their current room. Create a shared pointer to the message and queue it up to be send to every
+    /// client in that same room the next time a write event for that client is recieved.
     fn handle_message_from_authorized_user(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token, username: String, message: String) {
         let mut bad_conn_tokens: Vec<Token> = Vec::new();
+        let timestamp = time::strftime("%Y:%m:%d %H:%M:%S", &time::now()).unwrap().into_bytes();
+        // Todo handle commands if the message starts with a /
+        let mut mes_with_sender: Vec<u8> = timestamp;
+        mes_with_sender.extend(" - ".as_bytes());
+        mes_with_sender.extend(username.into_bytes());
+        mes_with_sender.extend(": ".as_bytes());
+        mes_with_sender.extend(message.as_bytes());
+        
+        let mes_rc = Rc::new(mes_with_sender);
 
-        if let Some(username) = self.app.get_username(token) {
-            let mut timestamp = time::strftime("%Y:%m:%d %H:%M:%S", &time::now()).unwrap().into_bytes();
-            // Todo handle commands if the message starts with a /
-            let mut mes_with_sender: Vec<u8> = timestamp;
-            mes_with_sender.extend(" - ".as_bytes());
-            mes_with_sender.extend(username.into_bytes());
-            mes_with_sender.extend(": ".as_bytes());
-            mes_with_sender.extend(message.as_bytes());
-            
-            let mes_rc = Rc::new(mes_with_sender);
-
-            // Enter a new scope so the borrow ends before we reset connections for bad tokens
-            {
-                let tokens = self.app.get_message_recipients(token);
-                bad_conn_tokens = tokens.iter().filter(|recipient_token| {
-                    let conn = self.get_connection(**recipient_token);
-                    conn.send_message(mes_rc.clone());
-                    conn.reregister(event_loop).is_err()
-                }).cloned().collect();
+        // Enter a new scope so the borrow ends before we reset connections for bad tokens
+        {
+            let tokens = self.app.get_message_recipients(token);
+            for &recipient_token in tokens.iter() {
+                let conn = self.get_connection(recipient_token);
+                conn.send_message(mes_rc.clone());
+                if conn.reregister(event_loop).is_err() {
+                    bad_conn_tokens.push(recipient_token);
+                }
             }
+        }
 
-            for bad_token in bad_conn_tokens {
-                self.reset_connection(event_loop, bad_token);
-            }
-        };
+        for bad_token in bad_conn_tokens {
+            self.reset_connection(event_loop, bad_token);
+        }
     }
 
+    /// Handle messages starting with a /. Currently, if the command doesn't match one of our existing commands we don't do anything
     fn handle_command_message(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token, message: &String) {
         match ChatCommand::new(message) {
             Some(ChatCommand::ListRooms) => {
@@ -152,7 +161,11 @@ impl ChatServer {
                 conn.send_message(Rc::new(format!("Moved to room {}\n", room_name).to_string().into_bytes()));
                 conn.reregister(event_loop);
             }
-            None => {}
+            None => {
+                let conn = self.get_connection(token);
+                conn.send_message(Rc::new("Not a valid command\n".to_string().into_bytes()));
+                conn.reregister(event_loop);
+            }
         }
 
         
@@ -193,12 +206,21 @@ impl ChatServer {
         match self.connections.insert_with(|token| {ChatConnection::new(sock, token)}) {
             // If we successfully insert, then register our connection.
             Some(token) => {
-                self.get_connection(token).send_message(Rc::new("Server: Select a username:\n".into()));
+
                 match self.get_connection(token).register(event_loop) {
                     Ok(_) => {},
                     Err(e) => {
                         self.connections.remove(token);
                         return Err(format!("Failed to register {:?} connection with event loop, {:?}", token, e));
+                    }
+                }
+
+                match self.app.get_username(token) {
+                    Some(username) => {
+                        self.get_connection(token).send_message(Rc::new(format!("Server: Welcome back {}:\n", username).into()));
+                    },
+                    None => {
+                        self.get_connection(token).send_message(Rc::new("Server: Select a username:\n".into()));
                     }
                 }
             },

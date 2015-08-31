@@ -1,11 +1,10 @@
-use mio;
-use super::connection::ChatConnection;
+use mio::Token;
 use super::room::Roomname;
 
 pub type Username = String;
 
 pub struct ChatUser {
-    pub id: mio::Token,
+    pub id: Token,
     pub user_name: Username,
     pub location: Roomname
 }

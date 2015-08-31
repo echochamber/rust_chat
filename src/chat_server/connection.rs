@@ -1,6 +1,4 @@
-use std::str::FromStr;
 use std::mem;
-use std::net::SocketAddr;
 use std::io::Cursor;
 use std::io;
 use std::rc::Rc;
@@ -8,8 +6,6 @@ use std::rc::Rc;
 use mio;
 use mio::{Token, EventLoop, EventSet, TryRead, TryWrite, PollOpt};
 use mio::tcp::{TcpStream};
-use mio::util::Slab;
-use bytes::{Buf, Take, ByteBuf};
 
 use super::server::ChatServer;
 
@@ -51,7 +47,7 @@ impl ChatConnection {
         ChatConnection {
             socket: socket,
             token: token,
-            interest: EventSet::readable(),
+            interest: EventSet::readable() | EventSet::writable(),
             // Should be done with_capacity for a reasonable message size
             read_buf: Vec::new(),
             send_queue: Vec::new(),
@@ -71,10 +67,7 @@ impl ChatConnection {
         match self.socket.try_read_buf(&mut self.read_buf) {
             // 0 Bytes were read
             Ok(Some(0)) => {
-                // 0 bytes were read and the buffer is empty, the connection has been closed by the client
-                if self.read_buf.len() > 0 {
-                    self.state = ChatConnectionState::Closed
-                }
+                self.state = ChatConnectionState::Closed;
             }
 
             // n bytes were read
@@ -88,7 +81,7 @@ impl ChatConnection {
 
                     // Clear the current read buffer, but keep a handle to it since we will be returning it
                     // so that the server can add it to the other connection's send_queue's
-                    let mut read_buf = mem::replace(&mut self.read_buf, Vec::new());
+                    let read_buf = mem::replace(&mut self.read_buf, Vec::new());
 
                     // Alternatively we could return bytes::Take(Cursor::new(read_buf), limit)
                     // which is just an iterator that returns eof once its iterated over "limit" elements.
@@ -97,7 +90,7 @@ impl ChatConnection {
                         Ok(message) => {
                             return Some(message);
                         },
-                        Err(e) => {
+                        Err(_) => {
                             super::log_something("Data read from connection was not valid utf8");
                             return None;
                         }
@@ -106,7 +99,11 @@ impl ChatConnection {
             }
             // The socket's a liar! It wasn't actually ready for us to read from. 
             // Nothing we need to do here. Just keep listening same as before.
-            Ok(None) => {}
+            Ok(None) => {
+                if self.read_buf.len() > 0 {
+                    self.state = ChatConnectionState::Closed
+                }
+            }
             Err(e) => {
                 // Probably shouldn't panic here since this will abort the entire application
                 // due to an error that only relates to a single connection.
@@ -193,10 +190,6 @@ impl ChatConnection {
 
     pub fn deregister(&self, event_loop: &mut mio::EventLoop<ChatServer>) -> io::Result<()> {
         event_loop.deregister(&self.socket)
-    }
-
-    pub fn token(&self) -> Token {
-        self.token
     }
 
     /// Does this correctly handle mutlibyte utf8 characters currently? 
