@@ -188,8 +188,12 @@ impl ChatConnection {
         )
     }
 
-    pub fn deregister(&self, event_loop: &mut mio::EventLoop<ChatServer>) -> io::Result<()> {
+    pub fn deregister(&mut self, event_loop: &mut mio::EventLoop<ChatServer>) -> io::Result<()> {
         event_loop.deregister(&self.socket)
+    }
+
+    pub fn quit(&mut self) {
+        self.state = ChatConnectionState::Closed;
     }
 
     /// Does this correctly handle mutlibyte utf8 characters currently? 

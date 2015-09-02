@@ -92,10 +92,12 @@ impl<'a> ChatApp {
 	}
 
 	pub fn remove_user(&mut self, token: Token) {
-		let user = self.users.remove(&token).unwrap();
-		self.rooms.get_mut(&user.location).unwrap().members.remove(&token);
-		self.user_name_lookup.remove(&user.user_name);
-
-		println!("{:?}", self.user_name_lookup);
+		match self.users.remove(&token) {
+			Some(user) => {
+				self.rooms.get_mut(&user.location).unwrap().members.remove(&token);
+				self.user_name_lookup.remove(&user.user_name);
+			},
+			None => {}
+		}
 	}
 }

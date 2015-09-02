@@ -3,7 +3,8 @@
 pub enum ChatCommand {
 	ListRooms,
 	// ListRoomMembers(String), Todo
-	ChangeRoom(String)
+	ChangeRoom(String),
+	Quit
 }
 
 impl ChatCommand {
@@ -15,6 +16,9 @@ impl ChatCommand {
 		match split.next() {
 			Some("/rooms") => {
 				return Some(ChatCommand::ListRooms)
+			},
+			Some("/quit") => {
+				return Some(ChatCommand::Quit)
 			},
 			Some("/join") => {
 				match split.next() {

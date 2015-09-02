@@ -46,7 +46,7 @@ impl ChatServer {
         }
 
         if self.connections[token].is_closed() {
-            self.connections.remove(token);
+            self.reset_connection(event_loop, token);
         }
 
         return Ok(());
@@ -153,6 +153,10 @@ impl ChatServer {
                 let conn = self.get_connection(token);
                 conn.send_message(Rc::new(list.clone().into_bytes()));
                 conn.reregister(event_loop);
+            },
+            Some(ChatCommand::Quit) => {
+                let conn = self.get_connection(token);
+                conn.quit();
             },
             Some(ChatCommand::ChangeRoom(room_name)) => {
                 self.app.move_rooms(token, &room_name);

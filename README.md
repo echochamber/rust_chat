@@ -23,3 +23,4 @@ Currently support commands are:
 
 * `/rooms` list all the currently active rooms
 * `/join ROOM_NAME` leaves your current room and joins another. If that room does not exist yet it is created.
+* `/quit` to disconnect from the server
