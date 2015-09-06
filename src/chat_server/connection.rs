@@ -1,6 +1,8 @@
 use std::mem;
-use std::io::Cursor;
+use std::collections::vec_deque::VecDeque;
 use std::io;
+use std::io::Cursor;
+use std::io::ErrorKind;
 use std::rc::Rc;
 
 use mio;
@@ -24,7 +26,7 @@ pub struct ChatConnection {
     token: mio::Token,
     
     // Events this connection is interested in listening on
-    interest: EventSet,
+    pub interest: EventSet,
 
     /// Buffer of bytes read from this connection. 
     ///
@@ -36,10 +38,16 @@ pub struct ChatConnection {
     /// 
     /// Each bytebuffer represents a message queued to write to this connection
     /// the next time it becomes ready to be written to
-    send_queue: Vec<Rc<Vec<u8>>>,
+    send_queue: VecDeque<Rc<Vec<u8>>>,
 
     /// Is this connection open/closed
-    state: ChatConnectionState
+    state: ChatConnectionState,
+
+    /// Number of failed read attempts on the socket, currently abort after 3
+    failed_read_attempts: u32,
+
+    /// Number of failed write attempts on the socket, currently abort after 3
+    failed_write_attempts: u32
 }
 
 impl ChatConnection {
@@ -50,8 +58,10 @@ impl ChatConnection {
             interest: EventSet::readable() | EventSet::writable(),
             // Should be done with_capacity for a reasonable message size
             read_buf: Vec::new(),
-            send_queue: Vec::new(),
-            state: ChatConnectionState::Open
+            send_queue: VecDeque::new(),
+            state: ChatConnectionState::Open,
+            failed_read_attempts: 0,
+            failed_write_attempts: 0
         }
     }
 
@@ -63,60 +73,65 @@ impl ChatConnection {
     /// Returns an RC (Thread-local reference-counted box) so that we can just copy a reference to each
     /// connections send_queue, and once they have all been written to, the reference count should drop
     /// to 0 and they the vec should automatically be freed.
-    pub fn read(&mut self, event_loop: &mut mio::EventLoop<ChatServer>) -> Option<String> {
+    pub fn read(&mut self) -> io::Result<Option<String>> {
         match self.socket.try_read_buf(&mut self.read_buf) {
             // 0 Bytes were read
             Ok(Some(0)) => {
                 self.state = ChatConnectionState::Closed;
+                return Err(::std::io::Error::new(ErrorKind::NotConnected, "No bytes read"));
             }
 
             // n bytes were read
             Ok(Some(n)) => {
                 super::log_something(format!("read {} bytes", n));
+                self.failed_read_attempts = 0;
 
                 // The conditions have been met so that the input read from this connection
                 // is now ready to be written to the other clients
+                //
+                // Limit is the number of characters up to the newline was detected, all characters after the newline are discarded.
                 if let Some(limit) = self.is_ready_to_write() {
-                    self.reregister(event_loop);
 
                     // Clear the current read buffer, but keep a handle to it since we will be returning it
                     // so that the server can add it to the other connection's send_queue's
                     let read_buf = mem::replace(&mut self.read_buf, Vec::new());
 
-                    // Alternatively we could return bytes::Take(Cursor::new(read_buf), limit)
-                    // which is just an iterator that returns eof once its iterated over "limit" elements.
                     self.read_buf.truncate(limit);
-                    match String::from_utf8(read_buf) {
+                    return match String::from_utf8(read_buf) {
                         Ok(message) => {
-                            return Some(message);
+                            return Ok(Some(message));
                         },
                         Err(_) => {
-                            super::log_something("Data read from connection was not valid utf8");
-                            return None;
+                            return Err(::std::io::Error::new(ErrorKind::InvalidInput, "Invalid utf8"));
                         }
                     }
-                };
+                } else {
+                    return Ok(None);
+                }
             }
             // The socket's a liar! It wasn't actually ready for us to read from. 
             // Nothing we need to do here. Just keep listening same as before.
             Ok(None) => {
-                if self.read_buf.len() > 0 {
-                    self.state = ChatConnectionState::Closed
-                }
+                self.failed_read_attempts = 0;
+
+                return Ok(None);
             }
             Err(e) => {
-                // Probably shouldn't panic here since this will abort the entire application
-                // due to an error that only relates to a single connection.
-                panic!("Error reading from connection token={:?}; err={:?}", self.token, e);
+                match e {
+                    // Todo, determine what error kinds warrant retries, immediately closing the connection, ect...
+                    // https://doc.rust-lang.org/std/io/enum.ErrorKind.html
+                    // 
+                    // For now just close the connection after 3 failed reads from the socket, regardless of the error type.
+                    _ => {
+                        self.failed_read_attempts += 1;
+                        if self.failed_read_attempts > 3 {
+                            self.state = ChatConnectionState::Closed;
+                        }
+                    }
+                }
+                return Err(e);
             }
         }
-
-        // As long as the connection is still open, we want to register it as a listener for read and write events again.
-        if self.state == ChatConnectionState::Open {
-            self.reregister(event_loop);
-        }
-
-        return None;
     }
 
     /// Writes to the connection, using the next entry from the send_queue.
@@ -124,22 +139,34 @@ impl ChatConnection {
     /// Only the next entry in the send_queue will be sent per call. It may be better to just send 
     /// them all at once, separated by newlines.
     pub fn write(&mut self) -> io::Result<()> {
-        let res = match self.send_queue.pop() {
+        let res = match self.send_queue.pop_front() {
             Some(buf) => {
                 match self.socket.try_write_buf(&mut Cursor::new(buf.to_vec())) {
                     Ok(None) => {
                         super::log_something(format!("client flushing buf; WouldBlock"));
 
                         // Put message back into the queue so we can try again
-                        self.send_queue.insert(0, buf);
-                        Ok(())
+                        self.failed_write_attempts += 1;
+                        if self.failed_write_attempts > 3 {
+                            self.state = ChatConnectionState::Closed;
+                            Err(io::Error::new(io::ErrorKind::Other, "Exceeded failed write attempts limit."))
+                        } else {
+                            self.send_queue.push_front(buf);
+                            Ok(())
+                        }
                     },
                     Ok(Some(n)) => {
+                        self.failed_write_attempts = 0;
                         super::log_something(format!("CONN : we wrote {} bytes", n));
                         Ok(())
                     },
                     Err(e) => {
                         super::log_something(format!("Failed to send buffer for {:?}, error: {}", self.token, e));
+                        self.failed_write_attempts += 1;
+                        if self.failed_write_attempts > 3 {
+                            self.state = ChatConnectionState::Closed;
+                        }
+
                         Err(e)
                     }
                 }
@@ -165,7 +192,7 @@ impl ChatConnection {
     /// Queues a message up to be written to this connection the next time it recieves a call to write
     /// If this connection was not subscribed to write events before, it is now.
     pub fn send_message(&mut self, message: Rc<Vec<u8>>) {
-        self.send_queue.push(message);
+        self.send_queue.push_back(message);
         self.interest.insert(EventSet::writable());
     }
 

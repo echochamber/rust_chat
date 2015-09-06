@@ -2,9 +2,10 @@ use mio;
 use mio::{Token, EventLoop, EventSet, PollOpt};
 use mio::tcp::*;
 use mio::util::Slab;
-use std::io;
-use std::rc::Rc;
 use time;
+
+use std::io::ErrorKind;
+use std::rc::Rc;
 
 use super::app::ChatApp;
 use super::connection::ChatConnection;
@@ -38,40 +39,57 @@ impl ChatServer {
 
     /// Function that is called when the chat server recieves a call to ready and the event set contains readable
     /// Handles all logic related to reading from any connection besides the server connection
-    fn read(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token) -> io::Result<()> {
+    fn read(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token) {
 
         // If we get Some back, then the message has been fully recieved and we can handle it accordingly
-        if let Some(message) = self.connections[token].read(event_loop) {
-            self.handle_message_read_from_client(event_loop, token, message);
+        match self.connections[token].read()
+        {
+            Ok(Some(message)) => {
+                self.handle_message_read_from_client(event_loop, token, message);
+            },
+            Ok(None) => {
+                // Nothing was read from the client, or a newline has not be encountered yet
+                // Either way, just keep listening.
+            }
+            Err(e) => {
+                self.handle_error_when_reading_from_client(token, e);
+            }
         }
 
         if self.connections[token].is_closed() {
             self.reset_connection(event_loop, token);
+        } else {
+            self.reregister(event_loop, token);
         }
-
-        return Ok(());
     }
 
     /// Function that is called when the chat server recieves a call to ready and the event set contains writable
     /// Handles all logic related to writing to any client connections
-    fn write(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token) -> io::Result<()> {
+    fn write(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token) {
         super::log_something(format!("Write event for {:?}", token));
         assert!(SERVER_TOKEN != token, "Received writable event for Server");
 
-        self.get_connection(token).write()
-            .and_then(|_| self.get_connection(token).reregister(event_loop))
-            .unwrap_or_else(|e| {
-                super::log_something(format!("Write event failed for {:?}, {:?}", token, e));
-                self.reset_connection(event_loop, token);
-            });
+        self.get_connection(token).write();
 
-        return Ok(());
+        if self.connections[token].is_closed() {
+            self.reset_connection(event_loop, token);
+        } else {
+            self.reregister(event_loop, token);
+        }
     }
 
-    /// Handle the message differnetly depending on the state of the client, and the message type
-    /// If the message starts with a '/' then handle it as a command.
-    /// If there is no entry in the app.users hashmap for this token, then handle the message as the user requesting their username
-    /// If these is an entry in the app.users hashmap then handle the message as the user sending a message to everbody in the same room as them
+    fn handle_error_when_reading_from_client(&mut self, token: Token, error: ::std::io::Error) {
+        // TODO, maybe need different behavior for different variants?
+        match error.kind() {
+            ErrorKind::InvalidInput => {
+                super::log_something("Data read from connection was not valid utf8");
+                self.connections[token].send_message(Rc::new("Server: Invalid utf8, message was discarded.\n".to_string().into_bytes()));
+            },
+            _ => {
+            }
+        };
+    }
+
     fn handle_message_read_from_client(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token, message: String) {
         if is_command(&message) {
             self.handle_command_message(event_loop, token, &message);
@@ -83,10 +101,10 @@ impl ChatServer {
             return;
         }
 
-        self.handle_message_from_unauthorized_user(event_loop, token, message);
+        self.handle_message_from_unauthorized_user(token, message);
     }
 
-    fn handle_message_from_unauthorized_user(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token, message: String) {
+    fn handle_message_from_unauthorized_user(&mut self, token: Token, message: String) {
         // We could validate that this message has no whitepspace, but for now just take the first piece of the message
         // split by whitespace and use that as the clients username.
         match message.split(char::is_whitespace).nth(0) {
@@ -95,8 +113,6 @@ impl ChatServer {
                     Ok(_) => {
                         let conn = self.get_connection(token);
                         conn.send_message(Rc::new("Server: you have been successfully authorized\n".to_string().into_bytes()));
-                        conn.reregister(event_loop);
-                        // TODO send a message to the client saying they have successfully authed as the given username
                     },
                     Err(e) => {
                         super::log_something(format!("{}", e));
@@ -115,7 +131,8 @@ impl ChatServer {
     fn handle_message_from_authorized_user(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token, username: String, message: String) {
         let mut bad_conn_tokens: Vec<Token> = Vec::new();
         let timestamp = time::strftime("%Y:%m:%d %H:%M:%S", &time::now()).unwrap().into_bytes();
-        // Todo handle commands if the message starts with a /
+        
+        // TODO: This could definitely be done more optimally but it works for now.
         let mut mes_with_sender: Vec<u8> = timestamp;
         mes_with_sender.extend(" - ".as_bytes());
         mes_with_sender.extend(username.into_bytes());
@@ -187,6 +204,24 @@ impl ChatServer {
         }
     }
 
+    /// Reregister a connection with the event loop
+    fn reregister(&mut self, event_loop: &mut EventLoop<ChatServer>, token: Token) {
+        if token == SERVER_TOKEN {
+            event_loop.reregister(
+                &self.server,
+                SERVER_TOKEN,
+                EventSet::readable(),
+                PollOpt::edge() | PollOpt::oneshot()
+            ).unwrap_or_else(|e| {
+                super::log_something(format!("Failed to reregister server {:?}, {:?}", SERVER_TOKEN, e));
+                self.reset_connection(event_loop, SERVER_TOKEN);
+            });
+        } else {
+            // Todo, figure out the behavior when we we fail to reregister a client connection
+            self.connections[token].reregister(event_loop);
+        }
+    }
+
     fn get_connection<'a>(&'a mut self, token: Token) -> &'a mut ChatConnection {
         &mut self.connections[token]
     }
@@ -235,19 +270,6 @@ impl ChatServer {
        
         return Ok(())
     }
-
-    /// Since the socket is registered
-    fn reregister(&mut self, event_loop: &mut EventLoop<ChatServer>) {
-        event_loop.reregister(
-            &self.server,
-            SERVER_TOKEN,
-            EventSet::readable(),
-            PollOpt::edge() | PollOpt::oneshot()
-        ).unwrap_or_else(|e| {
-            super::log_something(format!("Failed to reregister server {:?}, {:?}", SERVER_TOKEN, e));
-            self.reset_connection(event_loop, SERVER_TOKEN);
-        })
-    }
 }
 
 impl mio::Handler for ChatServer {
@@ -281,14 +303,10 @@ impl mio::Handler for ChatServer {
             super::log_something(format!("Read event for {:?}", token));
             if SERVER_TOKEN == token {
                 self.accept(event_loop);
-                self.reregister(event_loop);
+                self.reregister(event_loop, SERVER_TOKEN);
             } else {
 
-                self.read(event_loop, token)
-                    .unwrap_or_else(|e| {
-                        super::log_something(format!("Read event failed for {:?}: {:?}", token, e));
-                        self.reset_connection(event_loop, token);
-                    });
+                self.read(event_loop, token);
             }
         }
     }
